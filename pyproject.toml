@@ -7,11 +7,12 @@ authors = ["Erik Bjäreholt <erik@bjareho.lt>"]
 [tool.poetry.dependencies]
 python = "^3.7"
 aw-core = {git = "https://github.com/ActivityWatch/aw-core.git"}
+aw-client = {git = "https://github.com/ActivityWatch/aw-client.git"}
 
 [tool.poetry.dev-dependencies]
 black = "^20.8b1"
 pytest = "^6.2.3"
-mypy = "^0.812"
+mypy = "*"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

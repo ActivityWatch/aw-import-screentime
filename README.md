@@ -22,6 +22,9 @@ Run script with: `poetry run python3 main.py`
 
 ## Limitations of Knowledge.db
 
+ - macOS doesn't keep track of which apps are active and which are inactive (only that they run, or at least have an open window?)
+   - It almost seems like sometimes it does and sometimes it doesn't, weird.
+   - Is it different for iOS?
  - How far back does the history go?
    - On my VM it goes to 2020-02-01 (~2.5mo back), but I've definitely used the machine before that.
  - How often does the db file update?

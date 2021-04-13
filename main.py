@@ -1,7 +1,10 @@
 from datetime import datetime
+from pathlib import Path
 import sqlite3
 
 from aw_core import Event
+from aw_client import ActivityWatchClient
+
 
 query = """
 SELECT
@@ -41,9 +44,16 @@ SELECT
 
 
 def main() -> None:
-    DATABASE_PATH = "/home/erb/tmp/sync-with-vm-host/Knowledge/knowledgeC.db"
-    con = sqlite3.connect(DATABASE_PATH)
-    cur = con.cursor()
+    dbfile = _get_db_path()
+    print(f"Reading from database file at {dbfile}")
+
+    # Open the database
+    conn = sqlite3.connect(_get_db_path())
+
+    # Set journal mode to WAL.
+    conn.execute("pragma journal_mode=wal;")
+
+    cur = conn.cursor()
 
     rows = list(cur.execute(query))
     # TODO: Handle timezone. Maybe not needed if everything is in UTC anyway?
@@ -55,11 +65,46 @@ def main() -> None:
         )
         for row in rows
     ]
-    for e, r in zip(events, rows):
-        print(e.timestamp)
-        print(f" - duration: {e.duration}")
-        print(f" - data: {e.data}")
-        print(f" - raw row: {r}")
+
+    # for e, r in zip(events, rows):
+    #     print(e.timestamp)
+    #     print(f" - duration: {e.duration}")
+    #     print(f" - data: {e.data}")
+    #     print(f" - raw row: {r}")
+
+    send_to_activitywatch(events)
+
+
+def send_to_activitywatch(events):
+    print("Sending events to ActivityWatch...")
+
+    hostname = "macos-screentime-test"
+
+    # NOTE: 'aw-watcher-android' string is only there for aw-webui to detect it as a mobile device
+    bucket = f"aw-watcher-android_aw-import-screentime_{hostname}"
+
+    aw = ActivityWatchClient(client_name="aw-import-screentime")
+    aw.client_hostname = hostname
+
+    # buckets = aw.get_buckets()
+    # if bucket in buckets.keys():
+    #     ans = input("Bucket already found, overwrite? (y/N): ")
+    #     if ans == "y":
+    #         aw.delete_bucket(bucket, force=True)
+
+    aw.create_bucket(bucket, "currentwindow")
+    aw.send_events(bucket, events)
+
+
+def _get_db_path():
+    path_test = Path("~/tmp/sync-with-vm-host/Knowledge/knowledgeC.db").expanduser()
+    path_prod = Path(
+        "~/Library/Application Support/Knowledge/knowledgeC.db"
+    ).expanduser()
+
+    path = path_test if path_test.exists() else path_prod
+    assert path.exists(), "couldn't find database file"
+    return path
 
 
 if __name__ == "__main__":
