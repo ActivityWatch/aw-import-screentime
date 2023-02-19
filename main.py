@@ -93,7 +93,7 @@ def send_to_activitywatch(events):
     #         aw.delete_bucket(bucket, force=True)
 
     aw.create_bucket(bucket, "currentwindow")
-    aw.send_events(bucket, events)
+    aw.insert_events(bucket, events)
 
 
 def _get_db_path():
