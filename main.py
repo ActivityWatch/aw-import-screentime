@@ -1,9 +1,9 @@
+import sqlite3
 from datetime import datetime
 from pathlib import Path
-import sqlite3
 
-from aw_core import Event
 from aw_client import ActivityWatchClient
+from aw_core import Event
 
 
 def main() -> None:
@@ -11,72 +11,116 @@ def main() -> None:
     print(f"Reading from database file at {dbfile}")
     conn = sqlite3.connect(_get_db_path())
     conn.execute("pragma journal_mode=wal;")
-    cur = conn.cursor()
-    devices = get_devices(cur)
+    devices = get_devices(conn)
+    print(f"Found devices: {devices}")
+
+    print("Running for this device")
+    events = get_events_for_this_device(conn)
 
     for index, device in enumerate(devices):
-        events = get_events_for_device(device[0], cur)
+        device_id, device_name = device
+        events = get_events_for_device(conn, device_id)
         print(
-            f"{index + 1} / {len(devices)} Sending {len(events)} events to ActivityWatch for device {device[0]} - {device[1]}"
+            f"{index + 1} / {len(devices)} Sending {len(events)} events to ActivityWatch for device {device_id}"
         )
         if len(events) > 0:
             send_to_activitywatch(events, device)
 
 
-def get_devices(database_connection):
+r"""
+To explore the knowledgeC.db database, use the following command:
+
+$ sqlite3 ~/Library/Application\ Support/Knowledge/knowledgeC.db
+sqlite> .tables
+
+# Now, to see the table structure:
+sqlite> .schema ZOBJECT
+
+# To see the data:
+sqlite> SELECT * FROM ZOBJECT LIMIT 10;
+"""
+
+
+def get_devices(conn):
+    # Returns a list of tuples (device_id, device_name)
+    # FIXME: This doesn't seem to work, maybe only returns iOS devices?
+    #        I don't have any iOS devices to test with.
+    #        Possible fix is to use ZSOURCE.ZDEVICEID instead of ZSYNCPEER.ZDEVICEID
     query = """
-    SELECT
-      DISTINCT(ZSOURCE.ZDEVICEID) as deviceId,
-	  ZSYNCPEER.ZMODEL as deviceModel
-    FROM
-      ZSOURCE
-	  LEFT JOIN
-		ZSYNCPEER
-		ON ZSYNCPEER.ZDEVICEID = ZSOURCE.ZDEVICEID
+        SELECT
+            ZSYNCPEER.ZDEVICEID as deviceId,
+            ZSYNCPEER.ZMODEL as deviceModel
+        FROM
+            ZSYNCPEER
     """
-    return list(database_connection.execute(query))
+    return list(conn.execute(query))
 
 
-def get_events_for_device(device, database_connection):
+def get_events_for_this_device(conn):
+    # Retrieve events for this device (not synced events)
+    # Done by querying for events without ZDEVICEID set.
     query = """
-  SELECT
-    ZOBJECT.ZVALUESTRING AS "app",
-      (ZOBJECT.ZENDDATE - ZOBJECT.ZSTARTDATE) AS "usage",
-      CASE ZOBJECT.ZSTARTDAYOFWEEK
-        WHEN "1" THEN "Sunday"
-        WHEN "2" THEN "Monday"
-        WHEN "3" THEN "Tuesday"
-        WHEN "4" THEN "Wednesday"
-        WHEN "5" THEN "Thursday"
-        WHEN "6" THEN "Friday"
-        WHEN "7" THEN "Saturday"
-      END "dow",
-      ZOBJECT.ZSECONDSFROMGMT/3600 AS "tz",
-      DATETIME(ZOBJECT.ZSTARTDATE + 978307200, \'UNIXEPOCH\') as "start_time",
-      DATETIME(ZOBJECT.ZENDDATE + 978307200, \'UNIXEPOCH\') as "end_time",
-      DATETIME(ZOBJECT.ZCREATIONDATE + 978307200, \'UNIXEPOCH\') as "created_at",
-      CASE ZMODEL
-        WHEN ZMODEL THEN ZMODEL
-        ELSE "Other"
-      END "source",
-      ZSOURCE.ZDEVICEID AS "device"
-    FROM
-      ZOBJECT
-      LEFT JOIN
-        ZSTRUCTUREDMETADATA
-      ON ZOBJECT.ZSTRUCTUREDMETADATA = ZSTRUCTUREDMETADATA.Z_PK
-      LEFT JOIN
-        ZSOURCE
-      ON ZOBJECT.ZSOURCE = ZSOURCE.Z_PK
-      LEFT JOIN
-        ZSYNCPEER
-      ON ZSOURCE.ZDEVICEID = ZSYNCPEER.ZDEVICEID
-    WHERE
-      ZSTREAMNAME = "/app/usage"
-      AND 
-      device = ?
-  """
-    rows = list(database_connection.execute(query, (device,)))
+        SELECT
+          ZOBJECT.ZVALUESTRING AS "app",
+            (ZOBJECT.ZENDDATE - ZOBJECT.ZSTARTDATE) AS "usage",
+            ZOBJECT.ZSECONDSFROMGMT/3600 AS "tz",
+            DATETIME(ZOBJECT.ZSTARTDATE + 978307200, \'UNIXEPOCH\') as "start_time",
+            DATETIME(ZOBJECT.ZENDDATE + 978307200, \'UNIXEPOCH\') as "end_time",
+            DATETIME(ZOBJECT.ZCREATIONDATE + 978307200, \'UNIXEPOCH\') as "created_at",
+            ZSOURCE.ZDEVICEID AS "device"
+          FROM
+            ZOBJECT
+            LEFT JOIN
+              ZSTRUCTUREDMETADATA
+            ON ZOBJECT.ZSTRUCTUREDMETADATA = ZSTRUCTUREDMETADATA.Z_PK
+            LEFT JOIN
+              ZSOURCE
+            ON ZOBJECT.ZSOURCE = ZSOURCE.Z_PK
+          WHERE
+            ZSTREAMNAME = "/app/usage"
+    """
+    rows = list(conn.execute(query, ()))
+
+    # Check for events with ZDEVICEID set, should be empty (unless you have an iOS device and the query doesn't handle it)
+    assert all(row[-1] is None for row in rows)
+
+    # Debug print 10 longest events
+    for row in sorted(rows, key=lambda r: -r[1])[:10]:
+        print(row)
+
+
+def get_events_for_device(conn, device_id):
+    query = """
+        SELECT
+          ZOBJECT.ZVALUESTRING AS "app",
+            (ZOBJECT.ZENDDATE - ZOBJECT.ZSTARTDATE) AS "usage",
+            ZOBJECT.ZSECONDSFROMGMT/3600 AS "tz",
+            DATETIME(ZOBJECT.ZSTARTDATE + 978307200, \'UNIXEPOCH\') as "start_time",
+            DATETIME(ZOBJECT.ZENDDATE + 978307200, \'UNIXEPOCH\') as "end_time",
+            DATETIME(ZOBJECT.ZCREATIONDATE + 978307200, \'UNIXEPOCH\') as "created_at",
+            CASE ZMODEL
+              WHEN ZMODEL THEN ZMODEL
+              ELSE "Other"
+            END "source",
+            ZSOURCE.ZDEVICEID AS "device"
+          FROM
+            ZOBJECT
+            LEFT JOIN
+              ZSTRUCTUREDMETADATA
+            ON ZOBJECT.ZSTRUCTUREDMETADATA = ZSTRUCTUREDMETADATA.Z_PK
+            LEFT JOIN
+              ZSOURCE
+            ON ZOBJECT.ZSOURCE = ZSOURCE.Z_PK
+            LEFT JOIN
+              ZSYNCPEER
+            ON ZSOURCE.ZDEVICEID = ZSYNCPEER.ZDEVICEID
+          WHERE
+            ZSTREAMNAME = "/app/usage"
+            AND ZSOURCE.ZDEVICEID = ?
+    """
+    rows = list(conn.execute(query, (device_id,)))
+    for row in rows[:10]:
+        print(row)
     # TODO: Handle timezone. Maybe not needed if everything is in UTC anyway?
     return [
         Event(
@@ -88,8 +132,8 @@ def get_events_for_device(device, database_connection):
     ]
 
 
-def send_to_activitywatch(events, device):
-    hostname = f"ios-{device[0]}-{device[1]}"
+def send_to_activitywatch(events, device_id):
+    hostname = f"ios-{device_id}"
     # NOTE: 'aw-watcher-android' string is only there for aw-webui to detect it as a mobile device
     bucket = f"aw-watcher-android_aw-import-screentime_{hostname}"
 
