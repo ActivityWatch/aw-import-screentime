@@ -96,7 +96,7 @@ def send_to_activitywatch(events, device):
     aw = ActivityWatchClient(client_name="aw-import-screentime")
     aw.client_hostname = hostname
     aw.create_bucket(bucket, "currentwindow")
-    aw.send_events(bucket, events)
+    aw.insert_events(bucket, events)
 
 
 def _get_db_path():
