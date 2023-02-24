@@ -5,6 +5,7 @@ import sqlite3
 from aw_core import Event
 from aw_client import ActivityWatchClient
 
+
 def main() -> None:
     dbfile = _get_db_path()
     print(f"Reading from database file at {dbfile}")
@@ -14,13 +15,16 @@ def main() -> None:
     devices = get_devices(cur)
 
     for index, device in enumerate(devices):
-      events = get_events_for_device(device[0], cur)
-      print(f"{index + 1} / {len(devices)} Sending {len(events)} events to ActivityWatch for device {device[0]} - {device[1]}")
-      if len(events) > 0:
-        send_to_activitywatch(events, device)
-        
+        events = get_events_for_device(device[0], cur)
+        print(
+            f"{index + 1} / {len(devices)} Sending {len(events)} events to ActivityWatch for device {device[0]} - {device[1]}"
+        )
+        if len(events) > 0:
+            send_to_activitywatch(events, device)
+
+
 def get_devices(database_connection):
-  query = """
+    query = """
     SELECT
       DISTINCT(ZSOURCE.ZDEVICEID) as deviceId,
 	  ZSYNCPEER.ZMODEL as deviceModel
@@ -30,10 +34,11 @@ def get_devices(database_connection):
 		ZSYNCPEER
 		ON ZSYNCPEER.ZDEVICEID = ZSOURCE.ZDEVICEID
     """
-  return list(database_connection.execute(query))
+    return list(database_connection.execute(query))
+
 
 def get_events_for_device(device, database_connection):
-  query = """
+    query = """
   SELECT
     ZOBJECT.ZVALUESTRING AS "app",
       (ZOBJECT.ZENDDATE - ZOBJECT.ZSTARTDATE) AS "usage",
@@ -71,16 +76,17 @@ def get_events_for_device(device, database_connection):
       AND 
       device = ?
   """
-  rows = list(database_connection.execute(query, (device, )))
-  # TODO: Handle timezone. Maybe not needed if everything is in UTC anyway?
-  return [
-    Event(
-      timestamp=row[4],
-      duration=datetime.fromisoformat(row[5]) - datetime.fromisoformat(row[4]),
-      data={"app": row[0], "category": row[-1]},
-      )
-      for row in rows
-  ]
+    rows = list(database_connection.execute(query, (device,)))
+    # TODO: Handle timezone. Maybe not needed if everything is in UTC anyway?
+    return [
+        Event(
+            timestamp=row[4],
+            duration=datetime.fromisoformat(row[5]) - datetime.fromisoformat(row[4]),
+            data={"app": row[0], "category": row[-1]},
+        )
+        for row in rows
+    ]
+
 
 def send_to_activitywatch(events, device):
     hostname = f"ios-{device[0]}-{device[1]}"
@@ -92,15 +98,17 @@ def send_to_activitywatch(events, device):
     aw.create_bucket(bucket, "currentwindow")
     aw.send_events(bucket, events)
 
+
 def _get_db_path():
     path_test = Path("~/tmp/sync-with-vm-host/Knowledge/knowledgeC.db").expanduser()
     path_prod = Path(
-      "~/Library/Application Support/Knowledge/knowledgeC.db"
+        "~/Library/Application Support/Knowledge/knowledgeC.db"
     ).expanduser()
 
     path = path_test if path_test.exists() else path_prod
     assert path.exists(), "couldn't find database file"
     return path
+
 
 if __name__ == "__main__":
     main()
