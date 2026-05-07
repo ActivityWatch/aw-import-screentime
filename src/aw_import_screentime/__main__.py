@@ -781,6 +781,91 @@ class NewEvents:
     dirty: bool
 
 
+WATCH_TAIL_FILE_LIMIT = 2
+WATCH_SAFETY_RESCAN_SECONDS = 60.0
+
+
+def read_new_events_for_device(
+    dev: DeviceId,
+    state: DeviceState,
+    *,
+    tail_limit: int = WATCH_TAIL_FILE_LIMIT,
+) -> NewEvents:
+    """Return decoded protobufs newer than the watermark without mutating state."""
+    files = tail_device_files(dev, limit=tail_limit)
+    if not files:
+        logger.debug("[%s] no files found", dev)
+        return NewEvents([], None, None, False)
+
+    newest = files[-1]
+    try:
+        newest.stat()
+    except FileNotFoundError:
+        logger.debug("[%s] newest file disappeared: %s", dev, newest)
+        return NewEvents([], None, None, False)
+
+    prev_file = state.last_file
+    prev_file_name: Optional[str] = prev_file.name if prev_file is not None else None
+    logger.debug(
+        "[%s] newest=%s last_file=%s last_cf=%.3f",
+        dev,
+        newest.name,
+        prev_file_name,
+        state.last_cf,
+    )
+
+    candidates = files if state.last_file != newest else [newest]
+
+    new_events: list[AppInFocusEventT] = []
+    try:
+        for fp in candidates:
+            for ev in iter_app_in_focus_events(fp):
+                cf = getattr(ev, "cf_absolute_time", None)
+                if cf is None or cf <= state.last_cf:
+                    continue
+                new_events.append(ev)
+    except Exception as e:
+        logger.debug("[%s] read_new_events_for_device(%s) error: %s", dev, newest, e)
+        return NewEvents([], None, None, False)
+
+    if not new_events:
+        logger.debug("[%s] no new events in candidates", dev)
+        return NewEvents([], None, None, False)
+
+    max_cf = max(getattr(e, "cf_absolute_time", state.last_cf) for e in new_events)
+    logger.debug(
+        "[%s] new events=%d; cf watermark: %.3f -> %.3f",
+        dev,
+        len(new_events),
+        state.last_cf,
+        max_cf,
+    )
+    return NewEvents(new_events, newest, max_cf, True)
+
+
+def drain_changed_devices(
+    changed: set[DeviceId],
+    changed_lock: threading.Lock,
+) -> set[DeviceId]:
+    with changed_lock:
+        to_scan = set(changed)
+        changed.clear()
+    return to_scan
+
+
+def determine_watch_scan_targets(
+    *,
+    woke: bool,
+    drained_changed: set[DeviceId],
+    all_device_ids: Sequence[DeviceId],
+) -> set[DeviceId]:
+    if drained_changed:
+        return drained_changed
+    if not woke:
+        return set(all_device_ids)
+    return set()
+
+
 # --------------------------------------------------------------------------------------
 # SEGB decoding (protobuf payloads)
 # --------------------------------------------------------------------------------------
@@ -1671,82 +1756,38 @@ def cmd_watch(
     for dev in ids:
         runtimes[dev].bucket_id = sink.ensure_bucket(dev)
 
-    def read_new_events(dev: DeviceId, state: DeviceState) -> NewEvents:
-        """Return decoded protobufs newer than the watermark without mutating `state`."""
-        # Look at newest 1–2 files; 2 handles rotation without gaps.
-        files = tail_device_files(dev, limit=2)
-        if not files:
-            logger.debug("[%s] no files found", dev)
-            return NewEvents([], None, None, False)
-
-        newest = files[-1]
-        try:
-            newest.stat()
-        except FileNotFoundError:
-            logger.debug("[%s] newest file disappeared: %s", dev, newest)
-            return NewEvents([], None, None, False)
-
-        prev_file = state.last_file
-        prev_file_name: Optional[str] = (
-            prev_file.name if prev_file is not None else None
-        )
-        logger.debug(
-            "[%s] newest=%s last_file=%s last_cf=%.3f",
-            dev,
-            newest.name,
-            prev_file_name,
-            state.last_cf,
-        )
-
-        # If the newest file changed (rotation), scan both; else only newest.
-        candidates = files if state.last_file != newest else [newest]
-
-        new_events: list[AppInFocusEventT] = []
-        try:
-            for fp in candidates:
-                for ev in iter_app_in_focus_events(fp):
-                    cf = getattr(ev, "cf_absolute_time", None)
-                    if cf is None or cf <= state.last_cf:
-                        continue
-                    new_events.append(ev)
-        except Exception as e:
-            logger.debug("[%s] read_new_events(%s) error: %s", dev, newest, e)
-            return NewEvents([], None, None, False)
-
-        if not new_events:
-            logger.debug("[%s] no new events in candidates", dev)
-            return NewEvents([], None, None, False)
-
-        max_cf = max(getattr(e, "cf_absolute_time", state.last_cf) for e in new_events)
-        logger.debug(
-            "[%s] new events=%d; cf watermark: %.3f -> %.3f",
-            dev,
-            len(new_events),
-            state.last_cf,
-            max_cf,
-        )
-        return NewEvents(new_events, newest, max_cf, True)
+    # Do an immediate catch-up pass on startup so already-present unread events
+    # are not missed while waiting for the first filesystem notification.
+    with changed_lock:
+        changed.update(ids)
+    wake.set()
 
     # main loop (purely event-driven: no timeout polling)
     with client:
         try:
             while True:
-                # Block until watchdog reports a change
-                wake.wait()
-                wake.clear()
+                woke = wake.wait(timeout=WATCH_SAFETY_RESCAN_SECONDS)
+                if woke:
+                    wake.clear()
 
-                # Atomically snapshot and drain changed devices
-                with changed_lock:
-                    to_scan = set(changed)
-                    changed.clear()
-
+                to_scan = determine_watch_scan_targets(
+                    woke=woke,
+                    drained_changed=drain_changed_devices(changed, changed_lock),
+                    all_device_ids=ids,
+                )
                 if not to_scan:
                     continue  # spurious wake-ups; loop again
+                if not woke:
+                    logger.debug(
+                        "Safety rescan triggered after %.1fs idle; devices=%s",
+                        WATCH_SAFETY_RESCAN_SECONDS,
+                        sorted(to_scan),
+                    )
 
                 need_flush = False
                 for dev in to_scan:
                     state = runtimes[dev].state
-                    res = read_new_events(dev, state)
+                    res = read_new_events_for_device(dev, state)
 
                     if not res.events:
                         continue
