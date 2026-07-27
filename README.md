@@ -131,7 +131,7 @@ aw-import-screentime events preview --device ABCDEF0123456789 --limit 10 --since
 Run the same decoding logic, but stream the events into ActivityWatch. A bucket named `aw-import-screentime_ios_ios-<device_id>` is created per device (append `--bucket-suffix` for experiments).
 
 ```bash
-# Import the last 24h from every device into an ActivityWatch test server on port 5600
+# Import the last 24h from every device into the default ActivityWatch server on port 5600
 aw-import-screentime events import --since 24h --limit 20
 ```
 
@@ -175,6 +175,31 @@ ActivityWatch exposes a dedicated testing port (5666) when you launch `aw-server
 - `--port 5666` achieves the same override if you prefer to specify it explicitly.
 
 Both options keep the production data on port 5600 untouched while you verify the importer.
+
+## Development
+
+Install the locked development environment, run the test suite, and smoke-test
+the CLI:
+
+```bash
+uv sync --locked
+uv run pytest -q
+uv run aw-import-screentime --help
+```
+
+The implementation is intentionally compact:
+
+- `src/aw_import_screentime/__main__.py` contains the Typer commands,
+  configuration, Biome decoding, interval stitching, ActivityWatch integration,
+  and watcher state.
+- `src/aw_import_screentime/app_in_focus_extended.proto` defines the protobuf
+  schema; the adjacent `_pb2.py` and `_pb2.pyi` files are generated artifacts.
+- `tests/` contains unit tests that use fakes and temporary paths rather than
+  real Screen Time or ActivityWatch production data.
+
+Run integration experiments against `aw-server --testing` with the CLI's
+`--testing` flag. Do not use real device identifiers, Screen Time history, or
+ActivityWatch production data in tests, fixtures, issues, or pull requests.
 
 ## Limitations
 
