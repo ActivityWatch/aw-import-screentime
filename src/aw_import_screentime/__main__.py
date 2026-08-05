@@ -1648,7 +1648,14 @@ def cmd_watch(
             "aw-watcher-screentime", testing=effective_testing, port=effective_port
         )
 
-    all_ids = get_device_ids(SYNC_DB_PATH, platform=2)
+    # Some macOS versions record iOS/iPadOS peers as platform 1 rather than 2,
+    # so probe both and keep the first occurrence of each device.
+    all_ids = list(
+        dict.fromkeys(
+            get_device_ids(SYNC_DB_PATH, platform=2)
+            + get_device_ids(SYNC_DB_PATH, platform=1)
+        )
+    )
     ids = list(
         all_ids if selected_set is None else (d for d in all_ids if d in selected_set)
     )
