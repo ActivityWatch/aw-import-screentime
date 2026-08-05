@@ -157,6 +157,10 @@ def init_logging(level: str) -> None:
 # Biome base paths
 # --------------------------------------------------------------------------------------
 APPLE_EPOCH_OFFSET = 978307200  # CFAbsoluteTime offset to Unix epoch (s)
+# Upper bound for a single stitched foreground interval. When a device stops
+# syncing while an app is frontmost, the closing event only arrives once syncing
+# resumes, so the interval would otherwise span the entire gap.
+MAX_INTERVAL_SECONDS = 6 * 3600
 UTC = timezone.utc
 VALID_LOG_LEVELS = {"ERROR", "WARNING", "INFO", "DEBUG"}
 VALID_TZ_CHOICES = {"local", "utc"}
@@ -1089,10 +1093,20 @@ def stitch_intervals_with_state(
             and start_ts
             and ts > start_ts
         ):
+            duration = ts - start_ts
+            if duration.total_seconds() > MAX_INTERVAL_SECONDS:
+                logger.warning(
+                    "Clamping implausible interval: %s starting %s (%.1fh -> %.1fh)",
+                    current_bundle,
+                    start_ts.isoformat(),
+                    duration.total_seconds() / 3600,
+                    MAX_INTERVAL_SECONDS / 3600,
+                )
+                duration = timedelta(seconds=MAX_INTERVAL_SECONDS)
             stitched.append(
                 Event(
                     timestamp=start_ts,
-                    duration=ts - start_ts,
+                    duration=duration,
                     data={"app": current_bundle},
                 )
             )
@@ -1101,7 +1115,7 @@ def stitch_intervals_with_state(
                 current_bundle,
                 start_ts.isoformat(),
                 ts.isoformat(),
-                (ts - start_ts).total_seconds(),
+                duration.total_seconds(),
             )
 
         # Update state
