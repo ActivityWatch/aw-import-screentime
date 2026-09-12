@@ -40,7 +40,76 @@ aw-import-screentime --help
 aw-import-screentime watch --testing
 ```
 
-This launches the long-running watcher: it discovers your devices, keeps per-device watermarks, retries inserts if aw-server is briefly offline, and enriches events with App Store titles. Drop `--testing` to talk to a production server, and consider supervising the command with launchd, systemd, or a tmux session for continuous ingestion.
+This launches the long-running watcher: it discovers your devices, keeps per-device watermarks, waits for aw-server on startup if it is not up yet, retries inserts if aw-server is briefly offline, and enriches events with App Store titles. Drop `--testing` to talk to a production server, and consider supervising the command with launchd, systemd, or a tmux session for continuous ingestion.
+
+## Running continuously (launchd)
+
+On macOS a launch agent keeps the watcher alive across logins and restarts it if it exits. Save the following as `~/Library/LaunchAgents/com.example.aw-import-screentime.plist`, replacing the paths with your own checkout:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.aw-import-screentime</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/you/aw-import-screentime/.venv/bin/aw-import-screentime</string>
+        <string>watch</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/you/aw-import-screentime</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/you/Library/Logs/aw-import-screentime/watch.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/you/Library/Logs/aw-import-screentime/watch.err.log</string>
+</dict>
+</plist>
+```
+
+Grant Full Disk Access **before** loading the agent. The watcher reads `~/Library/Biome`, which is TCC-protected: it works from a terminal only because your terminal app holds that permission, and a launch agent inherits nothing. Add the interpreter behind the virtualenv to **System Settings → Privacy & Security → Full Disk Access**:
+
+```bash
+mkdir -p ~/Library/Logs/aw-import-screentime
+readlink -f .venv/bin/python   # add this path, not the .venv symlink
+```
+
+TCC keys on the resolved binary, so the symlink in `.venv/bin` will not work. Note that this grants Full Disk Access to that interpreter for every script it runs. Without it the agent exits with `OperationalError: unable to open database file` and, because of `KeepAlive`, retries every 30 seconds.
+
+Then load it and confirm it is running:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.aw-import-screentime.plist
+launchctl print gui/$(id -u)/com.example.aw-import-screentime | grep -E "state|pid|last exit"
+tail -f ~/Library/Logs/aw-import-screentime/watch.log
+```
+
+A healthy start logs `Ensured bucket ...` for each device and reports no `last exit code = 1`. If aw-server is not up yet the watcher logs one warning and waits for it rather than exiting, so boot order between the two does not matter.
+
+To remove it:
+
+```bash
+launchctl bootout gui/$(id -u)/com.example.aw-import-screentime
+rm ~/Library/LaunchAgents/com.example.aw-import-screentime.plist
+```
+
 
 ## Screen Time data locations
 

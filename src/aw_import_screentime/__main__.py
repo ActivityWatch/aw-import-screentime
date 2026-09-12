@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Iterable,
     Iterator,
     Optional,
@@ -864,6 +865,66 @@ def determine_watch_scan_targets(
     if not woke:
         return set(all_device_ids)
     return set()
+
+
+BUCKET_RETRY_MAX_DELAY_SECONDS = 60.0
+
+
+def _is_transient_aw_error(exc: requests.RequestException) -> bool:
+    """True for errors that are worth retrying (server down or still starting)."""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status is not None and status >= 500
+
+
+def ensure_buckets_blocking(
+    sink: EventSink,
+    device_ids: Sequence[DeviceId],
+    *,
+    retry_delay_seconds: float,
+    max_delay_seconds: float = BUCKET_RETRY_MAX_DELAY_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[DeviceId, str]:
+    """
+    Create the per-device buckets, waiting for aw-server if it is not up yet.
+
+    Retries only transient failures (connection refused/timeout, 5xx) with
+    exponential backoff; anything else (a bad bucket id, an auth failure)
+    propagates on the first attempt rather than hanging forever.
+    """
+    buckets: dict[DeviceId, str] = {}
+    pending = list(device_ids)
+    delay = max(retry_delay_seconds, 0.1)
+    attempts = 0
+    warned = False
+
+    while pending:
+        attempts += 1
+        try:
+            while pending:
+                dev = pending[0]
+                buckets[dev] = sink.ensure_bucket(dev)
+                pending.pop(0)
+        except requests.RequestException as exc:
+            if not _is_transient_aw_error(exc):
+                raise
+            address = getattr(getattr(sink, "client", None), "server_address", None)
+            if not warned:
+                warned = True
+                logger.warning(
+                    "aw-server not reachable at %s (%s); waiting for it to come up",
+                    address or "the configured address",
+                    exc,
+                )
+            else:
+                logger.debug("aw-server still unreachable (attempt %d): %s", attempts, exc)
+            sleep(delay)
+            delay = min(delay * 2, max_delay_seconds)
+
+    if warned:
+        logger.info("aw-server reachable after %d attempt(s); buckets ensured", attempts)
+    return buckets
 
 
 # --------------------------------------------------------------------------------------
@@ -1753,8 +1814,6 @@ def cmd_watch(
     logger.debug("state init: runtimes=%s", runtimes)
 
     sink = ActivityWatchSink(client, bucket_suffix=resolve_bucket_suffix(None, config))
-    for dev in ids:
-        runtimes[dev].bucket_id = sink.ensure_bucket(dev)
 
     # Do an immediate catch-up pass on startup so already-present unread events
     # are not missed while waiting for the first filesystem notification.
@@ -1765,6 +1824,12 @@ def cmd_watch(
     # main loop (purely event-driven: no timeout polling)
     with client:
         try:
+            # Bucket creation blocks until aw-server answers, so the watcher can
+            # be started before (or supervised alongside) the server.
+            for dev, ensured_bucket in ensure_buckets_blocking(
+                sink, ids, retry_delay_seconds=retry_delay_seconds
+            ).items():
+                runtimes[dev].bucket_id = ensured_bucket
             while True:
                 woke = wake.wait(timeout=WATCH_SAFETY_RESCAN_SECONDS)
                 if woke:
