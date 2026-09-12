@@ -1,7 +1,11 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+import pytest
+import requests
 from aw_core.models import Event
 
+import aw_import_screentime.__main__ as mod
 from aw_import_screentime.__main__ import ActivityWatchSink
 
 
@@ -116,3 +120,89 @@ def test_emit_dedupes_when_only_title_changes() -> None:
 
     assert inserted == 0
     assert client.insert_events_calls == []
+
+
+class FlakySink:
+    """Sink whose ensure_bucket fails a set number of times per device."""
+
+    def __init__(self, failures: dict[str, list[Exception]]) -> None:
+        self.failures = {dev: list(errs) for dev, errs in failures.items()}
+        self.calls: list[str] = []
+        self.client = SimpleNamespace(server_address="http://127.0.0.1:5666")
+
+    def ensure_bucket(self, device_id: str) -> str:
+        self.calls.append(device_id)
+        pending = self.failures.get(device_id)
+        if pending:
+            raise pending.pop(0)
+        return f"bucket-{device_id}"
+
+    def emit(self, bucket: str, events: list[Event]) -> int:  # pragma: no cover
+        raise AssertionError("not used")
+
+
+def test_ensure_buckets_blocking_returns_immediately_when_server_is_up() -> None:
+    sink = FlakySink({})
+    slept: list[float] = []
+
+    buckets = mod.ensure_buckets_blocking(
+        sink, ["a", "b"], retry_delay_seconds=5.0, sleep=slept.append
+    )
+
+    assert buckets == {"a": "bucket-a", "b": "bucket-b"}
+    assert sink.calls == ["a", "b"]
+    assert slept == []
+
+
+def test_ensure_buckets_blocking_waits_for_server_and_only_retries_pending() -> None:
+    sink = FlakySink(
+        {
+            "b": [
+                requests.ConnectionError("refused"),
+                requests.ConnectionError("refused"),
+            ]
+        }
+    )
+    slept: list[float] = []
+
+    buckets = mod.ensure_buckets_blocking(
+        sink,
+        ["a", "b"],
+        retry_delay_seconds=5.0,
+        max_delay_seconds=8.0,
+        sleep=slept.append,
+    )
+
+    assert buckets == {"a": "bucket-a", "b": "bucket-b"}
+    # "a" succeeded on the first attempt and is never re-created.
+    assert sink.calls == ["a", "b", "b", "b"]
+    # Exponential backoff, capped by max_delay_seconds.
+    assert slept == [5.0, 8.0]
+
+
+def test_ensure_buckets_blocking_retries_server_errors() -> None:
+    response = SimpleNamespace(status_code=503)
+    sink = FlakySink({"a": [requests.HTTPError("starting", response=response)]})
+    slept: list[float] = []
+
+    buckets = mod.ensure_buckets_blocking(
+        sink, ["a"], retry_delay_seconds=1.0, sleep=slept.append
+    )
+
+    assert buckets == {"a": "bucket-a"}
+    assert slept == [1.0]
+
+
+def test_ensure_buckets_blocking_raises_on_non_transient_error() -> None:
+    response = SimpleNamespace(status_code=400)
+    error = requests.HTTPError("bad bucket id", response=response)
+    sink = FlakySink({"a": [error]})
+    slept: list[float] = []
+
+    with pytest.raises(requests.HTTPError):
+        mod.ensure_buckets_blocking(
+            sink, ["a"], retry_delay_seconds=1.0, sleep=slept.append
+        )
+
+    assert sink.calls == ["a"]
+    assert slept == []
