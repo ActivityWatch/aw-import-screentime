@@ -116,3 +116,41 @@ def test_emit_dedupes_when_only_title_changes() -> None:
 
     assert inserted == 0
     assert client.insert_events_calls == []
+
+
+def test_emit_skips_clipped_rerun_covered_by_existing_event() -> None:
+    # `events import --since 24h` on a schedule: each run clips the boundary
+    # interval to a later start, so its exact key no longer matches.
+    bucket = "bucket-clipped"
+    existing = make_event(
+        datetime(2026, 5, 6, 12, 0, tzinfo=UTC), 3600, "com.example.app"
+    )
+    clipped = make_event(
+        existing.timestamp + timedelta(minutes=20), 2400, "com.example.app"
+    )
+    client = FakeActivityWatchClient(existing_events={bucket: [existing]})
+    sink = ActivityWatchSink(client)
+
+    inserted = sink.emit(bucket, [clipped])
+
+    assert inserted == 0
+    assert client.insert_events_calls == []
+
+
+def test_emit_keeps_events_not_fully_covered_by_same_app() -> None:
+    bucket = "bucket-partial"
+    existing = make_event(
+        datetime(2026, 5, 6, 12, 0, tzinfo=UTC), 3600, "com.example.app"
+    )
+    other_app = make_event(
+        existing.timestamp + timedelta(minutes=10), 60, "com.example.other"
+    )
+    extends_past = make_event(
+        existing.timestamp + timedelta(minutes=50), 1200, "com.example.app"
+    )
+    client = FakeActivityWatchClient(existing_events={bucket: [existing]})
+    sink = ActivityWatchSink(client)
+
+    inserted = sink.emit(bucket, [other_app, extends_past])
+
+    assert inserted == 2

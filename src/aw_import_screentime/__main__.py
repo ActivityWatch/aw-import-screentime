@@ -53,6 +53,7 @@ Storefronts: TypeAlias = Sequence[Storefront]
 Events: TypeAlias = list[Event]
 Watermarks: TypeAlias = dict[DeviceId, float]
 EventIdentity: TypeAlias = tuple[str, Optional[int], Optional[str]]
+EventSpan: TypeAlias = tuple[datetime, datetime, Optional[str]]
 
 # --------------------------------------------------------------------------------------
 # Version
@@ -524,15 +525,14 @@ class ActivityWatchSink:
             logger.debug("Bucket %s already exists (status=%s)", bucket_id, status)
         return bucket_id
 
-    def _load_existing_event_keys(
+    def _load_existing_events(
         self,
         bucket: str,
         *,
         start: datetime,
         end: datetime,
-    ) -> set[EventIdentity]:
-        existing = self.client.get_events(bucket, start=start, end=end)
-        return {_event_identity_key(event) for event in existing}
+    ) -> list[Event]:
+        return list(self.client.get_events(bucket, start=start, end=end))
 
     def emit(self, bucket: str, events: Sequence[Event]) -> int:
         """
@@ -545,18 +545,25 @@ class ActivityWatchSink:
             return 0
 
         start, end = _event_time_window(events)
-        existing_keys = self._load_existing_event_keys(bucket, start=start, end=end)
+        existing = self._load_existing_events(bucket, start=start, end=end)
 
         deduped: list[Event] = []
-        seen_keys = set(existing_keys)
+        seen_keys = {_event_identity_key(event) for event in existing}
+        # A rerun with a later --since clips the boundary interval to a new
+        # start, so its exact key differs from the stored event. Treat an event
+        # whose span is already covered by a stored event of the same app as a
+        # duplicate too.
+        seen_spans = [_event_span(event) for event in existing]
         skipped_duplicates = 0
         for event in events:
             key = _event_identity_key(event)
-            if key in seen_keys:
+            span = _event_span(event)
+            if key in seen_keys or any(_span_covers(seen, span) for seen in seen_spans):
                 skipped_duplicates += 1
                 continue
             deduped.append(event)
             seen_keys.add(key)
+            seen_spans.append(span)
 
         if not deduped:
             logger.info(
@@ -588,6 +595,18 @@ def _event_identity_key(event: Event) -> EventIdentity:
     app_name = str(app) if app is not None else None
     timestamp = event.timestamp.astimezone(UTC).isoformat()
     return (timestamp, _event_duration_microseconds(event), app_name)
+
+
+def _event_span(event: Event) -> EventSpan:
+    data = event.data if isinstance(event.data, dict) else {}
+    app = data.get("app")
+    start = event.timestamp
+    end = start + (event.duration or timedelta(0))
+    return (start, end, str(app) if app is not None else None)
+
+
+def _span_covers(outer: EventSpan, inner: EventSpan) -> bool:
+    return outer[2] == inner[2] and outer[0] <= inner[0] and inner[1] <= outer[1]
 
 
 def _event_time_window(events: Sequence[Event]) -> tuple[datetime, datetime]:
