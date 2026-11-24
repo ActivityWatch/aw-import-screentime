@@ -656,7 +656,26 @@ def tail_device_files(device_id: DeviceId, *, limit: int) -> list[Path]:
 
 
 def load_device_states() -> dict[DeviceId, "DeviceState"]:
-    """Load persisted per-device runtime state from STATE_FILE."""
+    """Load persisted per-device runtime state from STATE_FILE.
+
+    An unreadable file is logged and treated as empty (fine for startup).
+    """
+    try:
+        return _read_device_states()
+    except OSError:
+        logger.warning(
+            "Failed to read watermark state from %s; starting fresh",
+            STATE_FILE,
+            exc_info=True,
+        )
+        return {}
+
+
+def _read_device_states() -> dict[DeviceId, "DeviceState"]:
+    """Read STATE_FILE. A missing, corrupt or unrecognized file reads as empty
+    (the latter two with a warning); an I/O error other than "missing" raises
+    OSError so a merging writer can refuse to overwrite state it could not read.
+    """
     _migrate_legacy_state_file()
     try:
         with STATE_FILE.open("r") as f:
@@ -708,6 +727,8 @@ def load_device_states() -> dict[DeviceId, "DeviceState"]:
         )
     except FileNotFoundError:
         logger.debug("No prior watermark state at %s; starting fresh", STATE_FILE)
+    except OSError:
+        raise
     except Exception:
         logger.warning(
             "Failed to read watermark state from %s; starting fresh",
@@ -759,7 +780,9 @@ def save_device_states(
     try:
         with _state_lock():
             if merge:
-                device_states = {**load_device_states(), **device_states}
+                device_states = _merge_device_states(
+                    _read_device_states(), device_states
+                )
             _write_device_states(device_states)
     except Exception:
         if not getattr(save_device_states, "_warned", False):
@@ -767,6 +790,24 @@ def save_device_states(
                 "Failed to persist watermark state to %s", STATE_FILE, exc_info=True
             )
             setattr(save_device_states, "_warned", True)
+
+
+def _merge_device_states(
+    on_disk: dict[DeviceId, "DeviceState"],
+    incoming: dict[DeviceId, "DeviceState"],
+) -> dict[DeviceId, "DeviceState"]:
+    """Apply ``incoming`` over ``on_disk`` without ever moving a watermark back.
+
+    A watcher holds a startup copy of devices another watcher may have advanced
+    since; for such a device the saved state (watermark and open interval
+    together) wins.
+    """
+    merged = dict(on_disk)
+    for device_id, state in incoming.items():
+        saved = on_disk.get(device_id)
+        if saved is None or state.last_cf >= saved.last_cf:
+            merged[device_id] = state
+    return merged
 
 
 def _write_device_states(device_states: dict[DeviceId, "DeviceState"]) -> None:

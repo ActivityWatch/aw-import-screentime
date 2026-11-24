@@ -286,3 +286,57 @@ def test_legacy_last_cf_layout_still_loads(state_paths: Path) -> None:
     state_paths.write_text('{"last_cf": {"device-1": 42.0}}', encoding="utf-8")
 
     assert mod.load_device_states()["device-1"].last_cf == 42.0
+
+
+def test_merge_save_never_moves_a_watermark_back(state_paths: Path) -> None:
+    # Another watcher already advanced device-b past this watcher's startup copy.
+    mod.save_device_states(
+        {
+            "device-b": mod.DeviceState(
+                last_cf=900.0,
+                open_interval=mod.OpenIntervalState("com.example.b", 880.0),
+            )
+        }
+    )
+
+    # This watcher flushes its stale copy of device-b along with device-a.
+    mod.save_device_states(
+        {
+            "device-a": mod.DeviceState(last_cf=150.0),
+            "device-b": mod.DeviceState(
+                last_cf=500.0,
+                open_interval=mod.OpenIntervalState("com.example.old", 480.0),
+            ),
+        },
+        merge=True,
+    )
+
+    loaded = mod.load_device_states()
+    assert loaded["device-a"].last_cf == 150.0
+    # Watermark and open interval stay together, taken from the newer saved state.
+    assert loaded["device-b"].last_cf == 900.0
+    assert loaded["device-b"].open_interval == mod.OpenIntervalState(
+        "com.example.b", 880.0
+    )
+
+
+def test_merge_save_aborts_when_existing_state_cannot_be_read(
+    state_paths: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod.save_device_states({"device-b": mod.DeviceState(last_cf=900.0)})
+    before = state_paths.read_bytes()
+
+    real_open = Path.open
+
+    def deny_state_read(self: Path, *args, **kwargs):
+        if self == state_paths:
+            raise PermissionError(13, "Permission denied")
+        return real_open(self, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "open", deny_state_read)
+        # A read failure must not look like an empty file and wipe device-b.
+        mod.save_device_states({"device-a": mod.DeviceState(last_cf=1.0)}, merge=True)
+
+    assert state_paths.read_bytes() == before
+    assert mod.load_device_states()["device-b"].last_cf == 900.0
