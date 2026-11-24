@@ -630,7 +630,15 @@ def iter_device_files(device_id: DeviceId) -> Iterator[Path]:
     except (FileNotFoundError, PermissionError) as e:
         logger.warning("Skipping device %s: %s", device_id, e)
         return iter(())
-    files.sort(key=lambda p: p.stat().st_mtime)  # oldest → newest
+    by_mtime: list[tuple[float, Path]] = []
+    for p in files:
+        try:
+            by_mtime.append((p.stat().st_mtime, p))
+        except FileNotFoundError:
+            # Biome pruned or renamed the file after we listed it.
+            logger.debug("File vanished during enumeration: %s", p)
+    by_mtime.sort(key=lambda item: item[0])  # oldest → newest
+    files = [p for _, p in by_mtime]
     logger.debug("Enumerated files for %s: %d file(s)", device_id, len(files))
     return iter(files)
 
@@ -793,6 +801,13 @@ def read_new_events_for_device(
 ) -> NewEvents:
     """Return decoded protobufs newer than the watermark without mutating state."""
     files = tail_device_files(dev, limit=tail_limit)
+    if state.last_cf != float("-inf") and (
+        state.last_file is None or state.last_file not in files
+    ):
+        # Catching up from a persisted watermark (restart, or several rotations
+        # since the last scan): unread events may sit in files older than the
+        # tail window, so read them all; the watermark filter skips old records.
+        files = tail_device_files(dev, limit=0)
     if not files:
         logger.debug("[%s] no files found", dev)
         return NewEvents([], None, None, False)
@@ -817,16 +832,23 @@ def read_new_events_for_device(
     candidates = files if state.last_file != newest else [newest]
 
     new_events: list[AppInFocusEventT] = []
-    try:
-        for fp in candidates:
-            for ev in iter_app_in_focus_events(fp):
-                cf = getattr(ev, "cf_absolute_time", None)
-                if cf is None or cf <= state.last_cf:
-                    continue
-                new_events.append(ev)
-    except Exception as e:
-        logger.debug("[%s] read_new_events_for_device(%s) error: %s", dev, newest, e)
-        return NewEvents([], None, None, False)
+    for fp in candidates:
+        try:
+            file_events = [
+                ev
+                for ev in iter_app_in_focus_events(fp)
+                if getattr(ev, "cf_absolute_time", None) is not None
+                and ev.cf_absolute_time > state.last_cf
+            ]
+        except Exception as e:
+            if fp == newest:
+                # Possibly mid-write; retry on the next change or rescan rather
+                # than advancing the watermark past records it still holds.
+                logger.debug("[%s] newest file %s not readable yet: %s", dev, fp, e)
+                return NewEvents([], None, None, False)
+            logger.warning("[%s] skipping unreadable file %s: %s", dev, fp, e)
+            continue
+        new_events.extend(file_events)
 
     if not new_events:
         logger.debug("[%s] no new events in candidates", dev)
@@ -1696,6 +1718,9 @@ def cmd_watch(
             if not p:
                 return
             dev_id = Path(p).parent.name  # .../remote/<device_id>/<file>
+            if dev_id not in runtimes:
+                # e.g. a file moved into a subdirectory of a device stream
+                return
             with changed_lock:
                 changed.add(dev_id)
             wake.set()
