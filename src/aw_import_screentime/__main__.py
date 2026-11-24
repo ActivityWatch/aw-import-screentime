@@ -1968,6 +1968,15 @@ def cmd_watch(
                     if flush_pending:
                         next_save_attempt = time.monotonic() + SAVE_RETRY_SECONDS
         finally:
+            # Ctrl+C (or any exit) during the retry wait must not drop progress
+            # that is only in memory: make one last attempt to save it.
+            if flush_pending:
+                try:
+                    save_device_states(
+                        {d: rt.state for d, rt in runtimes.items()}, merge=True
+                    )
+                except Exception:
+                    logger.exception("Final state save on exit failed")
             # Clean shutdown of observer if it was started
             if observer is not None:
                 observer.stop()

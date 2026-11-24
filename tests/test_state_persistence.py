@@ -427,4 +427,39 @@ def test_watch_does_not_retry_a_failed_save_on_every_rescan(
     result = run_watch(tmp_path, monkeypatch, ["device-a"], read_fn=read_fn)
 
     assert isinstance(result.exception, StopLoop), repr(result.exception)
-    assert saves["n"] == 1
+    # One attempt while running (the rescans wait out SAVE_RETRY_SECONDS),
+    # plus the single final attempt on exit.
+    assert saves["n"] == 2
+
+
+def test_watch_saves_pending_progress_on_ctrl_c(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state_paths: Path
+) -> None:
+    real_save = mod.save_device_states
+    saves = {"n": 0}
+
+    def flaky_save(states, **kwargs):
+        saves["n"] += 1
+        if saves["n"] == 1:
+            return False  # disk full; it frees up before the user quits
+        return real_save(states, **kwargs)
+
+    monkeypatch.setattr(mod, "save_device_states", flaky_save)
+    monkeypatch.setattr(mod, "SAVE_RETRY_SECONDS", 3600.0)
+    calls = {"n": 0}
+
+    def read_fn(device_id, state, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mod.NewEvents(
+                [make_focus_event("com.example.a", 200.0, True)],
+                tmp_path / "segb-file",
+                200.0,
+                True,
+            )
+        raise KeyboardInterrupt
+
+    run_watch(tmp_path, monkeypatch, ["device-a"], read_fn=read_fn)
+
+    assert saves["n"] == 2
+    assert mod.load_device_states()["device-a"].last_cf == 200.0
