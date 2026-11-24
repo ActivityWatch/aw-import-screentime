@@ -1977,8 +1977,8 @@ def cmd_watch(
                     ):
                         # The one-time save warning was already used up.
                         logger.warning(
-                            "Final state save on exit failed; progress since the"
-                            " last successful save will be rescanned"
+                            "Final state save on exit failed; unsaved progress"
+                            " may be replayed or lost on restart"
                         )
                 except Exception:
                     logger.exception("Final state save on exit failed")
