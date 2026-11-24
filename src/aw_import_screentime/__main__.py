@@ -1972,9 +1972,14 @@ def cmd_watch(
             # that is only in memory: make one last attempt to save it.
             if flush_pending:
                 try:
-                    save_device_states(
+                    if not save_device_states(
                         {d: rt.state for d, rt in runtimes.items()}, merge=True
-                    )
+                    ):
+                        # The one-time save warning was already used up.
+                        logger.warning(
+                            "Final state save on exit failed; progress since the"
+                            " last successful save will be rescanned"
+                        )
                 except Exception:
                     logger.exception("Final state save on exit failed")
             # Clean shutdown of observer if it was started

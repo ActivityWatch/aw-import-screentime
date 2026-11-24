@@ -370,12 +370,15 @@ def test_watch_retries_a_failed_save_on_the_next_rescan(
         if calls["n"] <= 3:
             # Idle rescans: the watermark already moved, so nothing is dirty.
             return mod.NewEvents([], None, None, False)
+        # The retry must happen while running, not only in the exit save.
+        saves_before_stop["n"] = saves["n"]
         raise StopLoop()
 
+    saves_before_stop = {"n": 0}
     result = run_watch(tmp_path, monkeypatch, ["device-a"], read_fn=read_fn)
 
     assert isinstance(result.exception, StopLoop), repr(result.exception)
-    assert saves["n"] >= 2
+    assert saves_before_stop["n"] >= 2
     assert mod.load_device_states()["device-a"].last_cf == 200.0
 
 
@@ -463,3 +466,30 @@ def test_watch_saves_pending_progress_on_ctrl_c(
 
     assert saves["n"] == 2
     assert mod.load_device_states()["device-a"].last_cf == 200.0
+
+
+def test_watch_warns_when_the_final_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state_paths: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(mod, "save_device_states", lambda states, **kw: False)
+    monkeypatch.setattr(mod, "SAVE_RETRY_SECONDS", 3600.0)
+    calls = {"n": 0}
+
+    def read_fn(device_id, state, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mod.NewEvents(
+                [make_focus_event("com.example.a", 200.0, True)],
+                tmp_path / "segb-file",
+                200.0,
+                True,
+            )
+        raise KeyboardInterrupt
+
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        run_watch(tmp_path, monkeypatch, ["device-a"], read_fn=read_fn)
+
+    assert "Final state save on exit failed" in caplog.text
