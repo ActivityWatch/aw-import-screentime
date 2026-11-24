@@ -355,6 +355,7 @@ def test_watch_retries_a_failed_save_on_the_next_rescan(
         return real_save(states, **kwargs)
 
     monkeypatch.setattr(mod, "save_device_states", flaky_save)
+    monkeypatch.setattr(mod, "SAVE_RETRY_SECONDS", 0.0)
     calls = {"n": 0}
 
     def read_fn(device_id, state, **kwargs):
@@ -395,3 +396,35 @@ def test_nan_watermark_loads_as_unscanned_and_can_be_replaced(
 
     mod.save_device_states({"device-a": mod.DeviceState(last_cf=300.0)}, merge=True)
     assert mod.load_device_states()["device-a"].last_cf == 300.0
+
+
+def test_watch_does_not_retry_a_failed_save_on_every_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state_paths: Path
+) -> None:
+    saves = {"n": 0}
+
+    def failing_save(states, **kwargs):
+        saves["n"] += 1
+        return False  # e.g. broken state.json and a full disk
+
+    monkeypatch.setattr(mod, "save_device_states", failing_save)
+    monkeypatch.setattr(mod, "SAVE_RETRY_SECONDS", 3600.0)
+    calls = {"n": 0}
+
+    def read_fn(device_id, state, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mod.NewEvents(
+                [make_focus_event("com.example.a", 200.0, True)],
+                tmp_path / "segb-file",
+                200.0,
+                True,
+            )
+        if calls["n"] <= 5:
+            return mod.NewEvents([], None, None, False)
+        raise StopLoop()
+
+    result = run_watch(tmp_path, monkeypatch, ["device-a"], read_fn=read_fn)
+
+    assert isinstance(result.exception, StopLoop), repr(result.exception)
+    assert saves["n"] == 1

@@ -1721,6 +1721,10 @@ def cmd_file(
 # --------------------------------------------------------------------------------------
 
 RETRY_DELAY_SECONDS = 5.0
+# A failed state save is retried on this interval rather than on every scan:
+# a persistent failure (unreadable state.json, full disk) would otherwise log
+# the same traceback on every file notification.
+SAVE_RETRY_SECONDS = 60.0
 
 
 @app.command("watch")
@@ -1876,6 +1880,7 @@ def cmd_watch(
 
     # main loop (purely event-driven: no timeout polling)
     flush_pending = False
+    next_save_attempt = 0.0
     with client:
         try:
             while True:
@@ -1953,13 +1958,15 @@ def cmd_watch(
                 # A failed save stays pending: the in-memory watermark has already
                 # moved, so an idle rescan would not mark it dirty again.
                 flush_pending = flush_pending or need_flush
-                if flush_pending:
+                if flush_pending and time.monotonic() >= next_save_attempt:
                     # Merge over the *current* on-disk state (under the state
                     # lock) so devices not watched in this run, or advanced by a
                     # concurrent watcher, keep their newer progress.
                     flush_pending = not save_device_states(
                         {d: rt.state for d, rt in runtimes.items()}, merge=True
                     )
+                    if flush_pending:
+                        next_save_attempt = time.monotonic() + SAVE_RETRY_SECONDS
         finally:
             # Clean shutdown of observer if it was started
             if observer is not None:
