@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import shutil
 import threading
@@ -698,8 +699,14 @@ def load_device_states() -> dict[DeviceId, "DeviceState"]:
                 str(k): DeviceState(last_cf=float(v))
                 for k, v in raw.items()
             }
+    except FileNotFoundError:
+        logger.debug("No prior watermark state at %s; starting fresh", STATE_FILE)
     except Exception:
-        logger.debug("No prior watermark state or failed to read; starting fresh")
+        logger.warning(
+            "Failed to read watermark state from %s; starting fresh",
+            STATE_FILE,
+            exc_info=True,
+        )
     return {}
 
 
@@ -728,14 +735,23 @@ def save_device_states(device_states: dict[DeviceId, "DeviceState"]) -> None:
                     "start_cf": state.open_interval.start_cf,
                 }
             devices_payload[device_id] = payload
-        with STATE_FILE.open("w") as f:
-            json.dump(
-                {
-                    "last_cf": last_cf_payload,
-                    "devices": devices_payload,
-                },
-                f,
-            )
+        # Write to a temp file and atomically replace, so a crash or full disk
+        # mid-write never leaves a truncated state file behind.
+        tmp_path = STATE_FILE.with_name(f".{STATE_FILE.name}.{os.getpid()}.tmp")
+        try:
+            with tmp_path.open("w") as f:
+                json.dump(
+                    {
+                        "last_cf": last_cf_payload,
+                        "devices": devices_payload,
+                    },
+                    f,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, STATE_FILE)
+        finally:
+            tmp_path.unlink(missing_ok=True)
     except Exception:
         if not getattr(save_device_states, "_warned", False):
             logger.warning(
@@ -1838,7 +1854,14 @@ def cmd_watch(
                         need_flush = True
 
                 if need_flush:
-                    save_device_states({d: rt.state for d, rt in runtimes.items()})
+                    # Merge over the startup snapshot so devices not watched in
+                    # this run (e.g. filtered by --device) keep their state.
+                    save_device_states(
+                        {
+                            **persisted,
+                            **{d: rt.state for d, rt in runtimes.items()},
+                        }
+                    )
         finally:
             # Clean shutdown of observer if it was started
             if observer is not None:
