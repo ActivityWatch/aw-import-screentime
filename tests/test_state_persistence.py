@@ -340,3 +340,58 @@ def test_merge_save_aborts_when_existing_state_cannot_be_read(
 
     assert state_paths.read_bytes() == before
     assert mod.load_device_states()["device-b"].last_cf == 900.0
+
+
+def test_watch_retries_a_failed_save_on_the_next_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state_paths: Path
+) -> None:
+    real_save = mod.save_device_states
+    saves = {"n": 0}
+
+    def flaky_save(states, **kwargs):
+        saves["n"] += 1
+        if saves["n"] == 1:
+            return False  # e.g. state.json briefly unreadable; nothing written
+        return real_save(states, **kwargs)
+
+    monkeypatch.setattr(mod, "save_device_states", flaky_save)
+    calls = {"n": 0}
+
+    def read_fn(device_id, state, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mod.NewEvents(
+                [make_focus_event("com.example.a", 200.0, True)],
+                tmp_path / "segb-file",
+                200.0,
+                True,
+            )
+        if calls["n"] <= 3:
+            # Idle rescans: the watermark already moved, so nothing is dirty.
+            return mod.NewEvents([], None, None, False)
+        raise StopLoop()
+
+    result = run_watch(tmp_path, monkeypatch, ["device-a"], read_fn=read_fn)
+
+    assert isinstance(result.exception, StopLoop), repr(result.exception)
+    assert saves["n"] >= 2
+    assert mod.load_device_states()["device-a"].last_cf == 200.0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"devices": {"device-a": {"last_cf": NaN}}}',
+        '{"last_cf": {"device-a": NaN}}',
+    ],
+)
+def test_nan_watermark_loads_as_unscanned_and_can_be_replaced(
+    state_paths: Path, content: str
+) -> None:
+    state_paths.parent.mkdir(parents=True)
+    state_paths.write_text(content, encoding="utf-8")
+
+    assert mod.load_device_states()["device-a"].last_cf == float("-inf")
+
+    mod.save_device_states({"device-a": mod.DeviceState(last_cf=300.0)}, merge=True)
+    assert mod.load_device_states()["device-a"].last_cf == 300.0

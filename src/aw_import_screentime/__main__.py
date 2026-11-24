@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import shutil
@@ -655,6 +656,19 @@ def tail_device_files(device_id: DeviceId, *, limit: int) -> list[Path]:
 # --------------------------------------------------------------------------------------
 
 
+def _parse_watermark(raw: Any) -> float:
+    """A saved watermark, or -inf (never scanned) if it is missing or invalid.
+
+    NaN is invalid: it compares false against everything, so a NaN on disk would
+    block every later watermark from replacing it.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float("-inf")
+    return float("-inf") if math.isnan(value) else value
+
+
 def load_device_states() -> dict[DeviceId, "DeviceState"]:
     """Load persisted per-device runtime state from STATE_FILE.
 
@@ -687,10 +701,7 @@ def _read_device_states() -> dict[DeviceId, "DeviceState"]:
                 if not isinstance(raw_state, dict):
                     continue
                 last_cf_raw = raw_state.get("last_cf", float("-inf"))
-                try:
-                    last_cf = float(last_cf_raw)
-                except (TypeError, ValueError):
-                    last_cf = float("-inf")
+                last_cf = _parse_watermark(last_cf_raw)
 
                 open_interval_raw = raw_state.get("open_interval")
                 open_interval: Optional[OpenIntervalState] = None
@@ -718,7 +729,7 @@ def _read_device_states() -> dict[DeviceId, "DeviceState"]:
         if isinstance(raw, dict):
             # Legacy layout: a bare ``last_cf`` map without per-device state.
             return {
-                str(k): DeviceState(last_cf=float(v))
+                str(k): DeviceState(last_cf=_parse_watermark(v))
                 for k, v in raw.items()
             }
         logger.warning(
@@ -769,13 +780,14 @@ def _state_lock() -> Iterator[None]:
 
 def save_device_states(
     device_states: dict[DeviceId, "DeviceState"], *, merge: bool = False
-) -> None:
+) -> bool:
     """Persist per-device runtime state to STATE_FILE.
 
     With ``merge=True`` the on-disk state is re-read under the state lock and
     ``device_states`` is applied over it, so concurrent watchers (e.g. one per
     ``--device``) never overwrite each other's newer progress.
-    Logs a warning only once per process if persistence fails.
+    Returns whether the state was written. Logs a warning only once per process
+    if persistence fails.
     """
     try:
         with _state_lock():
@@ -784,12 +796,14 @@ def save_device_states(
                     _read_device_states(), device_states
                 )
             _write_device_states(device_states)
+        return True
     except Exception:
         if not getattr(save_device_states, "_warned", False):
             logger.warning(
                 "Failed to persist watermark state to %s", STATE_FILE, exc_info=True
             )
             setattr(save_device_states, "_warned", True)
+        return False
 
 
 def _merge_device_states(
@@ -1861,6 +1875,7 @@ def cmd_watch(
     wake.set()
 
     # main loop (purely event-driven: no timeout polling)
+    flush_pending = False
     with client:
         try:
             while True:
@@ -1935,11 +1950,14 @@ def cmd_watch(
                     if res.dirty:
                         need_flush = True
 
-                if need_flush:
+                # A failed save stays pending: the in-memory watermark has already
+                # moved, so an idle rescan would not mark it dirty again.
+                flush_pending = flush_pending or need_flush
+                if flush_pending:
                     # Merge over the *current* on-disk state (under the state
                     # lock) so devices not watched in this run, or advanced by a
                     # concurrent watcher, keep their newer progress.
-                    save_device_states(
+                    flush_pending = not save_device_states(
                         {d: rt.state for d, rt in runtimes.items()}, merge=True
                     )
         finally:
