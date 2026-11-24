@@ -137,6 +137,9 @@ def run_watch(tmp_path, monkeypatch, ids, *, read_fn, extra_args=()):
         mod, "enrich_events_with_titles", lambda events, storefronts: None
     )
     monkeypatch.setattr(mod, "read_new_events_for_device", read_fn)
+    # init_logging sets logger.propagate=False, which would hide records from
+    # caplog in tests that run afterwards.
+    monkeypatch.setattr(mod, "init_logging", lambda level: None)
     return CliRunner().invoke(
         mod.app,
         [
@@ -198,3 +201,88 @@ def test_watch_with_device_filter_preserves_other_devices_state(
         "device-a",
         "device-b",
     }
+
+
+def test_merge_save_keeps_progress_written_by_another_watcher(
+    state_paths: Path,
+) -> None:
+    # Watcher A loaded its snapshot at startup, then watcher B advanced device-b.
+    mod.save_device_states({"device-a": mod.DeviceState(last_cf=100.0)})
+    mod.save_device_states(
+        {
+            "device-b": mod.DeviceState(
+                last_cf=900.0,
+                open_interval=mod.OpenIntervalState("com.example.b", 880.0),
+            )
+        },
+        merge=True,
+    )
+
+    # A flushes only its own device; B's newer state must survive.
+    mod.save_device_states({"device-a": mod.DeviceState(last_cf=150.0)}, merge=True)
+
+    loaded = mod.load_device_states()
+    assert loaded["device-a"].last_cf == 150.0
+    assert loaded["device-b"].last_cf == 900.0
+    assert loaded["device-b"].open_interval == mod.OpenIntervalState(
+        "com.example.b", 880.0
+    )
+
+
+def test_concurrent_merge_saves_do_not_lose_updates(state_paths: Path) -> None:
+    import threading
+
+    # Real flock serializes separate file descriptors, even within one process.
+    ids = [f"device-{i}" for i in range(8)]
+    barrier = threading.Barrier(len(ids))
+
+    def flush(device_id: str) -> None:
+        barrier.wait()
+        for n in range(5):
+            mod.save_device_states(
+                {device_id: mod.DeviceState(last_cf=float(n))}, merge=True
+            )
+
+    threads = [threading.Thread(target=flush, args=(d,)) for d in ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert set(mod.load_device_states()) == set(ids)
+
+
+def test_save_creates_private_file_regardless_of_umask(state_paths: Path) -> None:
+    import os
+    import stat
+
+    old = os.umask(0o022)
+    try:
+        mod.save_device_states({"device-1": mod.DeviceState(last_cf=1.0)})
+        mod.save_device_states({"device-1": mod.DeviceState(last_cf=2.0)})
+    finally:
+        os.umask(old)
+
+    assert stat.S_IMODE(state_paths.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    "content", ['{"devices": null}', '{"devices": null, "last_cf": 3}', "[1, 2]", "{}"]
+)
+def test_load_warns_on_unrecognized_state_layout(
+    state_paths: Path, caplog: pytest.LogCaptureFixture, content: str
+) -> None:
+    state_paths.parent.mkdir(parents=True)
+    state_paths.write_text(content, encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG, logger=mod.logger.name):
+        assert mod.load_device_states() == {}
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_legacy_last_cf_layout_still_loads(state_paths: Path) -> None:
+    state_paths.parent.mkdir(parents=True)
+    state_paths.write_text('{"last_cf": {"device-1": 42.0}}', encoding="utf-8")
+
+    assert mod.load_device_states()["device-1"].last_cf == 42.0

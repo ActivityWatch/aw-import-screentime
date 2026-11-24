@@ -6,8 +6,10 @@ import logging
 import os
 import sqlite3
 import shutil
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from datetime import tzinfo as dt_tzinfo
@@ -693,12 +695,17 @@ def load_device_states() -> dict[DeviceId, "DeviceState"]:
                 )
             return loaded
 
-        raw = data.get("last_cf", {})
+        raw = data.get("last_cf") if isinstance(data, dict) else None
         if isinstance(raw, dict):
+            # Legacy layout: a bare ``last_cf`` map without per-device state.
             return {
                 str(k): DeviceState(last_cf=float(v))
                 for k, v in raw.items()
             }
+        logger.warning(
+            "Unrecognized watermark state layout in %s; starting fresh",
+            STATE_FILE,
+        )
     except FileNotFoundError:
         logger.debug("No prior watermark state at %s; starting fresh", STATE_FILE)
     except Exception:
@@ -718,46 +725,80 @@ def load_watermarks() -> Watermarks:
     }
 
 
-def save_device_states(device_states: dict[DeviceId, "DeviceState"]) -> None:
+@contextmanager
+def _state_lock() -> Iterator[None]:
+    """Serialize read-merge-replace of STATE_FILE across watcher processes.
+
+    Locks the state directory itself (flock), so no extra file shows up next to
+    state.json. Without fcntl (non-POSIX) this degrades to no locking.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - ScreenTime is macOS-only
+        yield
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(STATE_DIR, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the flock
+
+
+def save_device_states(
+    device_states: dict[DeviceId, "DeviceState"], *, merge: bool = False
+) -> None:
     """Persist per-device runtime state to STATE_FILE.
+
+    With ``merge=True`` the on-disk state is re-read under the state lock and
+    ``device_states`` is applied over it, so concurrent watchers (e.g. one per
+    ``--device``) never overwrite each other's newer progress.
     Logs a warning only once per process if persistence fails.
     """
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        devices_payload = {}
-        last_cf_payload = {}
-        for device_id, state in device_states.items():
-            last_cf_payload[device_id] = state.last_cf
-            payload: dict[str, Any] = {"last_cf": state.last_cf}
-            if state.open_interval is not None:
-                payload["open_interval"] = {
-                    "bundle_id": state.open_interval.bundle_id,
-                    "start_cf": state.open_interval.start_cf,
-                }
-            devices_payload[device_id] = payload
-        # Write to a temp file and atomically replace, so a crash or full disk
-        # mid-write never leaves a truncated state file behind.
-        tmp_path = STATE_FILE.with_name(f".{STATE_FILE.name}.{os.getpid()}.tmp")
-        try:
-            with tmp_path.open("w") as f:
-                json.dump(
-                    {
-                        "last_cf": last_cf_payload,
-                        "devices": devices_payload,
-                    },
-                    f,
-                )
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, STATE_FILE)
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        with _state_lock():
+            if merge:
+                device_states = {**load_device_states(), **device_states}
+            _write_device_states(device_states)
     except Exception:
         if not getattr(save_device_states, "_warned", False):
             logger.warning(
                 "Failed to persist watermark state to %s", STATE_FILE, exc_info=True
             )
             setattr(save_device_states, "_warned", True)
+
+
+def _write_device_states(device_states: dict[DeviceId, "DeviceState"]) -> None:
+    devices_payload = {}
+    last_cf_payload = {}
+    for device_id, state in device_states.items():
+        last_cf_payload[device_id] = state.last_cf
+        payload: dict[str, Any] = {"last_cf": state.last_cf}
+        if state.open_interval is not None:
+            payload["open_interval"] = {
+                "bundle_id": state.open_interval.bundle_id,
+                "start_cf": state.open_interval.start_cf,
+            }
+        devices_payload[device_id] = payload
+    # Write to a private temp file (mkstemp creates it 0600, regardless of
+    # umask) and atomically replace, so a crash or full disk mid-write never
+    # leaves a truncated state file and the file is never world-readable.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=STATE_DIR, prefix=f".{STATE_FILE.name}.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(
+                {"last_cf": last_cf_payload, "devices": devices_payload},
+                f,
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATE_FILE)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def save_watermarks(last_cf: Watermarks) -> None:
@@ -1854,13 +1895,11 @@ def cmd_watch(
                         need_flush = True
 
                 if need_flush:
-                    # Merge over the startup snapshot so devices not watched in
-                    # this run (e.g. filtered by --device) keep their state.
+                    # Merge over the *current* on-disk state (under the state
+                    # lock) so devices not watched in this run, or advanced by a
+                    # concurrent watcher, keep their newer progress.
                     save_device_states(
-                        {
-                            **persisted,
-                            **{d: rt.state for d, rt in runtimes.items()},
-                        }
+                        {d: rt.state for d, rt in runtimes.items()}, merge=True
                     )
         finally:
             # Clean shutdown of observer if it was started
